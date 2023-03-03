@@ -12,7 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-""" Finetuning a ?? Transformers model for sequence classification on GLUE."""
 
 
 import argparse
@@ -50,7 +49,7 @@ from transformers import (
     get_scheduler,
 )
 
-from model3 import BertForSequenceClassification
+from model import BertForSequenceClassification
 
 logger = get_logger(__name__)
 
@@ -374,7 +373,7 @@ def main():
     )
 
     # Get the metric function
-    metric = evaluate.load("../f1_score.py")
+    metric = evaluate.load("./f1_score.py")
 
     model.eval()
     refs, preds, pred_scores = [], [], []
