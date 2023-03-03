@@ -1,0 +1,12 @@
+accelerate launch  run_dis_text_drg.py \
+  --train_file ../../cv_text_2/train_$1.json  \
+  --validation_file ../../cv_text_2/test_$1.json  \
+  --model_name_or_path "bert-base-chinese"  \
+  --max_length 400 \
+  --per_device_train_batch_size 4 \
+  --per_device_eval_batch_size 4 \
+  --with_tracking \
+  --learning_rate 2e-5 \
+  --num_train_epochs 50 \
+  --output_dir ./output_dis_text_drg/$1/ \
+  --checkpointing_steps epoch
