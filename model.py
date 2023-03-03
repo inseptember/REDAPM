@@ -1,50 +1,130 @@
+import copy
 from abc import ABC
-from typing import Optional, Union, Tuple
+from dataclasses import dataclass
+from typing import Optional, Union, Tuple, Callable, Any
 
 import torch
-from torch import nn
-from torch.nn import CrossEntropyLoss
+from torch import nn, Tensor
+from torch.nn import CrossEntropyLoss, ModuleList
 from transformers import BertModel, BertPreTrainedModel
 from transformers.modeling_outputs import SequenceClassifierOutput
 import torch.nn.functional as F
 
 
-class FocalLoss(nn.Module):
-    def __init__(self, class_num=2, alpha=0.20, gamma=1.5, use_alpha=True, size_average=True):
-        super(FocalLoss, self).__init__()
-        self.class_num = class_num
-        self.alpha = alpha
-        self.gamma = gamma
-        if use_alpha:
-            self.alpha = torch.tensor(alpha).cuda()
-            # self.alpha = torch.tensor(alpha)
+def _get_clones(module, N):
+    return ModuleList([copy.deepcopy(module) for i in range(N)])
 
-        self.softmax = nn.Softmax(dim=1)
-        self.use_alpha = use_alpha
-        self.size_average = size_average
 
-    def forward(self, pred, target):
+def _get_activation_fn(activation: str) -> Callable[[Tensor], Tensor]:
+    if activation == "relu":
+        return F.relu
+    elif activation == "gelu":
+        return F.gelu
 
-        prob = self.softmax(pred.view(-1,self.class_num))
-        prob = prob.clamp(min=0.0001,max=1.0)
+    raise RuntimeError("activation should be relu/gelu, not {}".format(activation))
 
-        target_ = torch.zeros(target.size(0),self.class_num).cuda()
-        # target_ = torch.zeros(target.size(0),self.class_num)
-        target_.scatter_(1, target.view(-1, 1).long(), 1.)
 
-        if self.use_alpha:
-            batch_loss = - self.alpha.double() * torch.pow(1-prob,self.gamma).double() * prob.log().double() * target_.double()
+@dataclass
+class DepClassifierOutput(SequenceClassifierOutput):
+    visit_hidden_states: Optional[Tuple[torch.FloatTensor]] = None
+    visit_attentions: Optional[Tuple[torch.FloatTensor]] = None
+    drug_hidden_states: Optional[Tuple[torch.FloatTensor]] = None
+    drug_attentions: Optional[Tuple[torch.FloatTensor]] = None
+    device: Optional[str] = None
+
+
+
+class TransformerEncoderLayer(nn.Module):
+    __constants__ = ['batch_first', 'norm_first']
+
+    def __init__(self, d_model: int, nhead: int, dim_feedforward: int = 2048, dropout: float = 0.1,
+                 activation: Union[str, Callable[[Tensor], Tensor]] = F.relu,
+                 layer_norm_eps: float = 1e-5, batch_first: bool = True, norm_first: bool = True,
+                 device=None, dtype=None) -> None:
+        factory_kwargs = {'device': device, 'dtype': dtype}
+        super(TransformerEncoderLayer, self).__init__()
+        self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=batch_first,
+                                               **factory_kwargs)
+        # Implementation of Feedforward model
+        self.linear1 = nn.Linear(d_model, dim_feedforward, **factory_kwargs)
+        self.dropout = nn.Dropout(dropout)
+        self.linear2 = nn.Linear(dim_feedforward, d_model, **factory_kwargs)
+
+        self.norm_first = norm_first
+        self.norm1 = nn.LayerNorm(d_model, eps=layer_norm_eps, **factory_kwargs)
+        self.norm2 = nn.LayerNorm(d_model, eps=layer_norm_eps, **factory_kwargs)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+
+        # Legacy string support for activation function.
+        if isinstance(activation, str):
+            activation = _get_activation_fn(activation)
+
+        # We can't test self.activation in forward() in TorchScript,
+        # so stash some information about it instead.
+        if activation is F.relu:
+            self.activation_relu_or_gelu = 1
+        elif activation is F.gelu:
+            self.activation_relu_or_gelu = 2
         else:
-            batch_loss = - torch.pow(1-prob,self.gamma).double() * prob.log().double() * target_.double()
+            self.activation_relu_or_gelu = 0
+        self.activation = activation
 
-        batch_loss = batch_loss.sum(dim=1)
+    def __setstate__(self, state):
+        if 'activation' not in state:
+            state['activation'] = F.relu
+        super(TransformerEncoderLayer, self).__setstate__(state)
 
-        if self.size_average:
-            loss = batch_loss.mean()
-        else:
-            loss = batch_loss.sum()
+    def forward(self, src: Tensor, src_mask: Optional[Tensor] = None,
+                src_key_padding_mask: Optional[Tensor] = None) -> Tuple[Any, Any]:
+        x = src
+        hidden, att = self._sa_block(self.norm1(x), src_mask, src_key_padding_mask)
+        x = x + hidden
+        x = x + self._ff_block(self.norm2(x))
 
-        return loss
+        return x, att
+
+    # self-attention block
+    def _sa_block(self, x: Tensor,
+                  attn_mask: Optional[Tensor], key_padding_mask: Optional[Tensor]) -> Tuple[Any, Any]:
+        x, att = self.self_attn(x, x, x,
+                                attn_mask=attn_mask,
+                                key_padding_mask=key_padding_mask,
+                                need_weights=True)
+        return self.dropout1(x), att
+
+    # feed forward block
+    def _ff_block(self, x: Tensor) -> Tensor:
+        x = self.linear2(self.dropout(self.activation(self.linear1(x))))
+        return self.dropout2(x)
+
+
+class TransformerEncoder(nn.Module):
+    __constants__ = ['norm']
+
+    def __init__(self, encoder_layer, num_layers, norm=None, enable_nested_tensor=False):
+        super(TransformerEncoder, self).__init__()
+        self.layers = _get_clones(encoder_layer, num_layers)
+        self.num_layers = num_layers
+        self.norm = norm
+        self.enable_nested_tensor = enable_nested_tensor
+
+    def forward(self, src: Tensor, mask: Optional[Tensor] = None, src_key_padding_mask: Optional[Tensor] = None,
+                return_attention=False) -> Tuple[
+        Union[Tensor, Any], Union[Optional[Tuple[Any]], Any], Union[Optional[Tuple[Any]], Any]]:
+
+        output = src
+        hidden_layers = None
+        attention_weights = None
+        for mod in self.layers:
+            output, att = mod(output, src_mask=mask, src_key_padding_mask=src_key_padding_mask)
+            if hidden_layers is None:
+                hidden_layers = (output,)
+                attention_weights = (att,)
+            else:
+                hidden_layers = hidden_layers + (output, )
+                attention_weights = attention_weights + (att, )
+        return output, hidden_layers, attention_weights
 
 
 class BertForSequenceClassification(BertPreTrainedModel, ABC):
@@ -78,8 +158,8 @@ class BertForSequenceClassification(BertPreTrainedModel, ABC):
         )
 
         # self.attn = nn.MultiheadAttention(mid_dim, 8, dropout=0.2, batch_first=True)
-        self.visit_encoder = nn.TransformerEncoder(
-            nn.TransformerEncoderLayer(mid_dim, nhead=4, batch_first=True, norm_first=True),
+        self.visit_encoder = TransformerEncoder(
+            TransformerEncoderLayer(mid_dim, nhead=4, batch_first=True, norm_first=True),
             num_layers=4
         )
 
@@ -89,20 +169,20 @@ class BertForSequenceClassification(BertPreTrainedModel, ABC):
         self.post_init()
 
     def forward(
-        self,
-        input_ids: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        drug_input_ids: Optional[torch.Tensor] = None,
-        drug_attention_mask: Optional[torch.Tensor] = None,
-        other: Optional[torch.Tensor] = None,
-        token_type_ids: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.Tensor] = None,
-        head_mask: Optional[torch.Tensor] = None,
-        inputs_embeds: Optional[torch.Tensor] = None,
-        labels: Optional[torch.Tensor] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
+            self,
+            input_ids: Optional[torch.Tensor] = None,
+            attention_mask: Optional[torch.Tensor] = None,
+            drug_input_ids: Optional[torch.Tensor] = None,
+            drug_attention_mask: Optional[torch.Tensor] = None,
+            other: Optional[torch.Tensor] = None,
+            labels: Optional[torch.Tensor] = None,
+            # token_type_ids: Optional[torch.Tensor] = None,
+            # position_ids: Optional[torch.Tensor] = None,
+            # head_mask: Optional[torch.Tensor] = None,
+            # inputs_embeds: Optional[torch.Tensor] = None,
+            output_attentions: Optional[bool] = None,
+            output_hidden_states: Optional[bool] = None,
+            return_dict: Optional[bool] = None,
     ) -> Union[Tuple[torch.Tensor], SequenceClassifierOutput]:
         r"""
         labels (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
@@ -110,6 +190,19 @@ class BertForSequenceClassification(BertPreTrainedModel, ABC):
             config.num_labels - 1]`. If `config.num_labels == 1` a regression loss is computed (Mean-Square loss), If
             `config.num_labels > 1` a classification loss is computed (Cross-Entropy).
         """
+        input_ids = input_ids.int()
+        attention_mask = attention_mask.int()
+        drug_input_ids = drug_input_ids.int()
+        drug_attention_mask = drug_attention_mask.int()
+        # other = data_input['other']
+        # labels = data_input['labels']
+        return_dict = True
+        output_attentions = True
+        output_hidden_states = True
+        head_mask = None
+
+
+
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         batch_size, visit_num, seq_length = input_ids.shape
@@ -120,10 +213,10 @@ class BertForSequenceClassification(BertPreTrainedModel, ABC):
         outputs = self.bert(
             input_ids,
             attention_mask=attention_mask,
-            token_type_ids=token_type_ids,
-            position_ids=position_ids,
-            head_mask=head_mask,
-            inputs_embeds=inputs_embeds,
+            token_type_ids=None,
+            position_ids=None,
+            head_mask=None,
+            inputs_embeds=None,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
@@ -168,9 +261,9 @@ class BertForSequenceClassification(BertPreTrainedModel, ABC):
         output_feature = self.dense(output_feature)
 
         # output_feature, _ = self.attn(output_feature, output_feature, output_feature)
-        if not self.training:
-            output_feature = output_feature.half()
-        output_feature = self.visit_encoder(output_feature)
+        # if not self.training:
+        #     output_feature = output_feature.half()
+        output_feature, visit_hidden_states, visit_attentions = self.visit_encoder(output_feature)
 
         # pooled_output = self.dropout(pooled_output)
         logits = self.classifier(output_feature[:, 0])
@@ -179,16 +272,22 @@ class BertForSequenceClassification(BertPreTrainedModel, ABC):
         loss = None
         if labels is not None:
             # loss_fct = CrossEntropyLoss(torch.tensor([0.1, 1]).float().to(logits.device))
-            loss_fct = CrossEntropyLoss()
+            loss_fct = CrossEntropyLoss(reduction='none')
             # loss_fct = FocalLoss()
             loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1).long())
-        if not return_dict:
-            output = (logits,) + output_feature[:, 0]
-            return ((loss,) + output) if loss is not None else output
-
-        return SequenceClassifierOutput(
-            loss=loss,
-            logits=logits,
-            hidden_states=output_feature[:, 0],
-            attentions=None,
-        )
+        # if not return_dict:
+        #     output = (logits,) + output_feature[:, 0]
+        #     return ((loss,) + output) if loss is not None else output
+        #
+        # return DepClassifierOutput(
+        #     loss=loss,
+        #     logits=logits,
+        #     hidden_states=outputs.hidden_states,
+        #     attentions=outputs.attentions,
+        #     drug_hidden_states=drug_outputs.hidden_states,
+        #     drug_attentions=drug_outputs.attentions,
+        #     visit_hidden_states=visit_hidden_states,
+        #     visit_attentions=visit_attentions,
+        #     device=loss.device
+        # )
+        return logits.softmax(-1)
