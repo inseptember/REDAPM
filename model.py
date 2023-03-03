@@ -272,22 +272,22 @@ class BertForSequenceClassification(BertPreTrainedModel, ABC):
         loss = None
         if labels is not None:
             # loss_fct = CrossEntropyLoss(torch.tensor([0.1, 1]).float().to(logits.device))
-            loss_fct = CrossEntropyLoss(reduction='none')
+            loss_fct = CrossEntropyLoss(reduction='mean')
             # loss_fct = FocalLoss()
             loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1).long())
         # if not return_dict:
         #     output = (logits,) + output_feature[:, 0]
         #     return ((loss,) + output) if loss is not None else output
         #
-        # return DepClassifierOutput(
-        #     loss=loss,
-        #     logits=logits,
-        #     hidden_states=outputs.hidden_states,
-        #     attentions=outputs.attentions,
-        #     drug_hidden_states=drug_outputs.hidden_states,
-        #     drug_attentions=drug_outputs.attentions,
-        #     visit_hidden_states=visit_hidden_states,
-        #     visit_attentions=visit_attentions,
-        #     device=loss.device
-        # )
-        return logits.softmax(-1)
+        return DepClassifierOutput(
+            loss=loss,
+            logits=logits,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+            drug_hidden_states=drug_outputs.hidden_states,
+            drug_attentions=drug_outputs.attentions,
+            visit_hidden_states=visit_hidden_states,
+            visit_attentions=visit_attentions,
+            device=loss.device
+        )
+#         return logits.softmax(-1)
