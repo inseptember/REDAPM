@@ -2,5 +2,5 @@
 
 Trainging  
 '''
-bash run_dis_text_drg.sh <cross validation folder index>
+bash run_drg_3.sh <cross validation folder index>
 '''
